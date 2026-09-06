@@ -1,0 +1,134 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+
+Console.OutputEncoding = Encoding.UTF8;
+// Один и тот же текст отправляется всем трём моделям без изменений.
+string testPrompt = "Компания выбирает один из трех проектов для инвестирования на один год. Проект А. Инвестиции 10 млн руб. Вероятность успеха 80 процентов. Прибыль при успехе 5 млн руб. Убыток при неудаче 4 млн руб. Проект Б. Инвестиции 10 млн руб. Вероятность успеха 60 процентов. Прибыль при успехе 9 млн руб. Убыток при неудаче 3 млн руб. Проект В. Инвестиции 10 млн руб. Вероятность успеха 95 процентов. Прибыль при успехе 3 млн руб. Убыток при неудаче 8 млн руб. Компания может выбрать только один проект. Руководство хочет максимизировать ожидаемую прибыль, но потеря более 5 млн руб. в случае неудачи считается неприемлемой. Проанализируй варианты и выбери наиболее рациональный проект. Обоснуй решение расчетами. Если данных недостаточно для однозначного решения, укажи это.";
+var apiKey = Environment.GetEnvironmentVariable("OPENAI_API_KEY")?.Trim();
+if (string.IsNullOrWhiteSpace(apiKey))
+{
+    var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+    try
+    {
+        foreach (var fileName in new[] { "Ключ", "Ключ.txt" })
+        {
+            var keyPath = Path.Combine(desktop, fileName);
+            if (!File.Exists(keyPath)) continue;
+            apiKey = File.ReadAllText(keyPath).Trim();
+            if (!string.IsNullOrWhiteSpace(apiKey)) break;
+        }
+    }
+    catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+    {
+        Console.Error.WriteLine("Не удалось прочитать файл ключа на рабочем столе. Проверьте доступ к файлу.");
+        return 1;
+    }
+}
+if (string.IsNullOrWhiteSpace(apiKey))
+{
+    Console.Error.WriteLine("Ключ не найден. Сохраните его в файл «Ключ» или «Ключ.txt» на рабочем столе либо задайте OPENAI_API_KEY.");
+    return 1;
+}
+
+var models = new[]
+{
+    (Name: "gpt-5.4-nano", Input: 0.20m, Output: 1.25m),
+    (Name: "gpt-5.4-mini", Input: 0.75m, Output: 4.50m),
+    (Name: "gpt-5.4", Input: 2.50m, Output: 15.00m)
+};
+using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+var results = new List<ExperimentResult>();
+Console.WriteLine($"Общий промпт:\n{Redact(testPrompt)}\n");
+foreach (var model in models)
+{
+    Console.WriteLine($"Запрос к {model.Name}...");
+    var result = new ExperimentResult { Model = model.Name };
+    results.Add(result);
+    var timer = new Stopwatch();
+    try
+    {
+        var json = JsonSerializer.Serialize(new { model = model.Name, input = testPrompt, store = false });
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        // Замер включает отправку и получение всего тела ответа, без разбора и печати.
+        timer.Start();
+        using var response = await client.PostAsync("https://api.openai.com/v1/responses", content);
+        var body = await response.Content.ReadAsStringAsync();
+        timer.Stop();
+        if (!response.IsSuccessStatusCode)
+            result.Error = $"HTTP {(int)response.StatusCode} ({response.ReasonPhrase}):\n{body}";
+        else
+        {
+            using var document = JsonDocument.Parse(body);
+            var root = document.RootElement;
+            var parts = new List<string>();
+            if (root.TryGetProperty("output", out var output))
+                foreach (var item in output.EnumerateArray())
+                {
+                    if (!item.TryGetProperty("type", out var type) || type.GetString() != "message"
+                        || !item.TryGetProperty("content", out var messageContent)) continue;
+                    foreach (var part in messageContent.EnumerateArray())
+                    {
+                        var partType = part.GetProperty("type").GetString();
+                        if (partType == "output_text") parts.Add(part.GetProperty("text").GetString() ?? "");
+                        else if (partType == "refusal") parts.Add(part.GetProperty("refusal").GetString() ?? "");
+                    }
+                }
+            result.Answer = string.Join(Environment.NewLine, parts);
+            if (root.TryGetProperty("usage", out var usage) && usage.ValueKind == JsonValueKind.Object)
+            {
+                result.InputTokens = usage.GetProperty("input_tokens").GetInt64();
+                result.OutputTokens = usage.GetProperty("output_tokens").GetInt64();
+                result.TotalTokens = usage.GetProperty("total_tokens").GetInt64();
+                result.Cost = (result.InputTokens.Value * model.Input + result.OutputTokens.Value * model.Output) / 1_000_000m;
+            }
+            if (root.TryGetProperty("status", out var status) && status.GetString() != "completed")
+            {
+                result.Error = $"Статус ответа: {status.GetString()}.";
+                if (root.TryGetProperty("error", out var error) && error.ValueKind != JsonValueKind.Null)
+                    result.Error += $"\n{error}";
+                if (root.TryGetProperty("incomplete_details", out var details) && details.ValueKind != JsonValueKind.Null)
+                    result.Error += $"\n{details}";
+            }
+        }
+    }
+    catch (TaskCanceledException) { result.Error = "Истекло время ожидания API (10 минут)."; }
+    catch (Exception ex) when (ex is HttpRequestException or JsonException or InvalidOperationException or KeyNotFoundException)
+    { result.Error = $"{ex.GetType().Name}: {ex.Message}"; }
+    finally { timer.Stop(); result.Elapsed = timer.Elapsed; }
+    Console.WriteLine(result.Error is null ? "Ответ получен." : Redact(result.Error));
+}
+foreach (var result in results)
+{
+    Console.WriteLine($"\n=== {result.Model} ===");
+    Console.WriteLine(string.IsNullOrEmpty(result.Answer) ? "Текст ответа отсутствует." : Redact(result.Answer));
+    if (result.Error is not null) Console.WriteLine($"Ошибка: {Redact(result.Error)}");
+    if (result.InputTokens is null) Console.WriteLine("API не предоставил usage; токены и стоимость неизвестны.");
+}
+Console.WriteLine("\nМодель       | Время ответа | Input tokens | Output tokens | Total tokens | Стоимость запроса");
+Console.WriteLine(new string('-', 100));
+foreach (var result in results)
+{
+    var elapsed = result.Elapsed.TotalSeconds.ToString("F3", CultureInfo.InvariantCulture) + " с";
+    var cost = result.Cost.HasValue ? "$" + result.Cost.Value.ToString("F8", CultureInfo.InvariantCulture) : "—";
+    Console.WriteLine($"{result.Model,-12} | {elapsed,12} | {Tokens(result.InputTokens),12} | {Tokens(result.OutputTokens),13} | {Tokens(result.TotalTokens),12} | {cost}");
+}
+Console.WriteLine("Стоимость приблизительная, по заданным тарифам без скидки за кэширование. — означает отсутствие данных.");
+Console.WriteLine("Для ошибочного запроса указано время до получения ошибки; подробности выше.");
+return 0;
+string Redact(string text) => text.Replace(apiKey, "[API-ключ скрыт]", StringComparison.Ordinal);
+static string Tokens(long? value) => value?.ToString(CultureInfo.InvariantCulture) ?? "—";
+sealed class ExperimentResult
+{
+    public string Model { get; init; } = "";
+    public TimeSpan Elapsed { get; set; }
+    public string? Answer { get; set; }
+    public string? Error { get; set; }
+    public long? InputTokens { get; set; }
+    public long? OutputTokens { get; set; }
+    public long? TotalTokens { get; set; }
+    public decimal? Cost { get; set; }
+}
