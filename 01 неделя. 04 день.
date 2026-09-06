@@ -1,0 +1,118 @@
+using System.Globalization;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Text;
+using System.Text.Json;
+
+Console.InputEncoding = Encoding.UTF8;
+Console.OutputEncoding = Encoding.UTF8;
+double temperature;
+while (true)
+{
+    Console.Write("Введите temperature от 0 до 2 (например, 0,7): ");
+    var input = Console.ReadLine();
+    if (input is null) return;
+    if (double.TryParse(input.Trim().TrimStart('\uFEFF').Replace(',', '.'), NumberStyles.Float,
+            CultureInfo.InvariantCulture, out temperature)
+        && double.IsFinite(temperature) && temperature >= 0 && temperature <= 2)
+        break;
+    Console.WriteLine("Нужно число от 0 до 2. Допустимы точка и запятая.");
+}
+
+using var cancellation = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) => { e.Cancel = true; cancellation.Cancel(); };
+try
+{
+    // Ключ читается при запуске и не сохраняется в проекте.
+    var desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+    var keyPath = new[] { Path.Combine(desktop, "Ключ.txt"), Path.Combine(desktop, "Ключ") }
+        .FirstOrDefault(File.Exists);
+    if (keyPath is null)
+        throw new InvalidOperationException("На рабочем столе не найден файл Ключ.txt или Ключ с API-ключом OpenAI.");
+    var apiKey = (await File.ReadAllTextAsync(keyPath, cancellation.Token)).Trim();
+    if (string.IsNullOrWhiteSpace(apiKey) || apiKey.Any(char.IsWhiteSpace))
+        throw new InvalidOperationException("Файл Ключ должен содержать только API-ключ в одной строке.");
+
+    const string model = "gpt-4.1-mini";
+    const string systemPrompt = @"Ты составляешь программы силовых тренировок на русском языке.
+Не задавай вопросов. Обозначь допущения: программа вводная для совершеннолетнего
+начинающего без известных ограничений; возраст, здоровье, опыт и погода неизвестны.
+Не определяй нагрузку только по росту и массе. Предусмотри разминку, восстановление,
+запас 2–3 повторения, постепенную прогрессию, устойчивые нескользкие опоры,
+защиту от ветра и влаги, прекращение занятия при признаках переохлаждения,
+перенос в помещение при небезопасной погоде. Не выдавай одну температуру воздуха
+за универсальный безопасный предел. Резина на морозе допустима только в пределах
+температур эксплуатации производителя. Не придумывай актуальные цены, ссылки
+и наличие: суммы покупок обозначай как ориентировочный бюджет.
+Проверь, что сумма покупок не превышает 15000 рублей.
+Temperature влияет на вариативность текста, а не на интенсивность тренировки.";
+    const string userPrompt = @"Составь одну недельную программу силовых тренировок на улице зимой.
+Мой рост 183 см, масса 85 кг. Есть зимние кроссовки, штаны, топ, перчатки и шапка.
+Бюджет на дополнительную одежду и спортивный инвентарь — 15000 рублей.
+В первую очередь восполни недостающую защиту от холода. Не предполагай наличие турника:
+если он нужен, предложи замену. Запланируй 3 силовых дня с восстановлением между ними.
+Выведи краткие допущения, таблицу на все 7 дней с упражнениями, подходами, повторениями
+и отдыхом, таблицу покупок с назначением, ориентировочными ценами и итогом,
+затем разминку, правила зимней безопасности и прогрессии.
+Используй компактные Markdown-таблицы без блока кода. Все упражнения должны быть
+выполнимы с имеющейся или предложенной экипировкой.";
+
+    using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(3) };
+    client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+    Console.WriteLine($"Составляю программу… Модель: {model}, temperature: {temperature.ToString(CultureInfo.InvariantCulture)}");
+    using var response = await client.PostAsJsonAsync("https://api.openai.com/v1/chat/completions", new
+    {
+        model,
+        temperature,
+        max_completion_tokens = 4500,
+        messages = new[]
+        {
+            new { role = "system", content = systemPrompt },
+            new { role = "user", content = userPrompt }
+        }
+    }, cancellation.Token);
+    if (!response.IsSuccessStatusCode)
+    {
+        // Не выводим тело ошибки API: оно может содержать сведения о ключе.
+        var explanation = (int)response.StatusCode switch
+        {
+            401 => "API-ключ недействителен. Проверьте файл Ключ.",
+            403 => "Нет доступа к API или выбранной модели.",
+            429 => "Превышен лимит запросов или исчерпан баланс API.",
+            >= 500 => "Сервис временно недоступен. Повторите запуск позже.",
+            _ => "Запрос отклонён. Проверьте доступ к модели и настройки API."
+        };
+        throw new InvalidOperationException($"Ошибка API {(int)response.StatusCode}: {explanation}");
+    }
+
+    using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellation.Token));
+    var choice = document.RootElement.GetProperty("choices")[0];
+    var content = choice.GetProperty("message").GetProperty("content").GetString();
+    if (string.IsNullOrWhiteSpace(content))
+        throw new InvalidOperationException("Модель не вернула текст программы. Повторите запуск.");
+    Console.WriteLine();
+    Console.WriteLine(content);
+    if (choice.GetProperty("finish_reason").GetString() == "length")
+        Console.WriteLine("\nВнимание: ответ обрезан из-за ограничения длины.");
+}
+catch (OperationCanceledException)
+{
+    Console.Error.WriteLine(cancellation.IsCancellationRequested
+        ? "Запрос отменён." : "Время ожидания API истекло. Повторите запуск.");
+    Environment.ExitCode = 1;
+}
+catch (HttpRequestException)
+{
+    Console.Error.WriteLine("Не удалось подключиться к OpenAI API. Проверьте интернет и доступность сервиса.");
+    Environment.ExitCode = 1;
+}
+catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+{
+    Console.Error.WriteLine("Не удалось прочитать файл с API-ключом на рабочем столе. Проверьте доступ к файлу.");
+    Environment.ExitCode = 1;
+}
+catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException or IndexOutOfRangeException)
+{
+    Console.Error.WriteLine(ex is InvalidOperationException ? ex.Message : "API вернул ответ неожиданного формата.");
+    Environment.ExitCode = 1;
+}
