@@ -1,0 +1,164 @@
+using System.Globalization;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Text;
+using System.Text.Json;
+
+Console.InputEncoding = Encoding.UTF8;
+Console.OutputEncoding = Encoding.UTF8;
+CultureInfo.CurrentCulture = CultureInfo.GetCultureInfo("ru-RU");
+
+string model = Environment.GetEnvironmentVariable("OPENAI_MODEL")?.Trim() ?? "gpt-4.1";
+if (string.IsNullOrWhiteSpace(model))
+    model = "gpt-4.1";
+
+using var handler = new HttpClientHandler { AllowAutoRedirect = false };
+using var client = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(3) };
+using var cancellation = new CancellationTokenSource();
+Console.CancelKeyPress += (_, e) =>
+{
+    e.Cancel = true;
+    cancellation.Cancel();
+};
+
+Console.WriteLine("Расчёт сетки с помощью LLM: инженер, критик-выскочка и аналитик.");
+Console.WriteLine($"Модель: {model}. Enter — выход, Ctrl+C — отмена.");
+Console.WriteLine("На каждый расчёт отправляется один API-запрос с тремя экспертными ролями.");
+
+while (!cancellation.IsCancellationRequested)
+{
+    Console.Write("\nВведите площадь помещения в м²: ");
+    string? input = Console.ReadLine();
+    if (string.IsNullOrWhiteSpace(input))
+        break;
+
+    if (!double.TryParse(input.Trim().Replace(',', '.'), NumberStyles.Float,
+            CultureInfo.InvariantCulture, out double area)
+        || !double.IsFinite(area) || area < 0.01 || area > 1_000_000)
+    {
+        Console.WriteLine("Введите число от 0,01 до 1 000 000. Допустимы точка и запятая.");
+        continue;
+    }
+
+    try
+    {
+        // Единственный источник ключа — файл на рабочем столе.
+        // Ключ передаётся только в заголовке авторизации, не в промпте.
+        string key = await ReadKeyAsync(cancellation.Token);
+        using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.openai.com/v1/responses");
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", key);
+        request.Content = JsonContent.Create(new
+        {
+            model,
+            store = false,
+            max_output_tokens = 3500,
+            instructions = "Отвечай по-русски. Ты моделируешь группу из трёх условных экспертов: " +
+                "инженер, критик-выскочка (скептичен, но вежлив) и аналитик. " +
+                "Каждый самостоятельно решает задачу расчёта количества арматурной сетки. " +
+                "Дай три отдельных раздела, затем общий итог. Не представляй роли как реальных специалистов. " +
+                "Недостающие вводные прими с явными допущениями, не задавай уточняющих вопросов. " +
+                "Известна только площадь: прими квадратную комнату и вычисли сторону как корень из площади. " +
+                "Для сопоставимости прими карты 2 × 3 м; инженер и аналитик используют нахлёст 10 см, " +
+                "критик проверяет отдельный сценарий 20 см. Это допущения, а не нормативные требования. " +
+                "Покажи краткие шаги расчёта и формулы: чистая площадь, раскладка, число целых карт, площадь закупки. " +
+                "Количество по каждому направлению: максимум из 1 и округлённого вверх " +
+                "((размер комнаты − нахлёст) / (размер карты − нахлёст)). " +
+                "Проверь покрытие: N × размер карты − (N − 1) × нахлёст не меньше стороны комнаты. " +
+                "Не округляй промежуточные размеры перед расчётом количества карт. " +
+                "Учитывай подрезку крайних карт; обсуди использование обрезков, " +
+                "но не уменьшай закупку без проверяемой раскладки. Не называй результат минимальным без доказательства. " +
+                "Разделяй чистую площадь и закупку; разница включает нахлёсты и обрезки. " +
+                "Толщина стяжки не доказывает достаточность армирования. " +
+                "Не выдумывай ссылки на нормы. Ответ не длиннее 650 слов.",
+            input = $"Площадь помещения: {area.ToString("R", CultureInfo.InvariantCulture)} м². " +
+                "Стяжка толщиной 6 см, сетка в один слой. Рассчитай необходимую сетку."
+        });
+
+        Console.WriteLine("Ожидаю ответ LLM...");
+        using var response = await client.SendAsync(request, cancellation.Token);
+        if (!response.IsSuccessStatusCode)
+        {
+            // Не выводим сырой ответ сервера: он может содержать сведения об авторизации.
+            Console.WriteLine($"Ошибка API (HTTP {(int)response.StatusCode}). " + ((int)response.StatusCode switch
+            {
+                401 => "Ключ не принят. Проверьте файл «Ключ» на рабочем столе.",
+                403 => "Доступ запрещён для этого ключа, проекта или региона.",
+                404 => "Модель недоступна. Её имя можно задать через OPENAI_MODEL.",
+                429 => "Превышен лимит запросов или исчерпана квота API.",
+                >= 500 => "Сервис временно недоступен. Повторите расчёт позже.",
+                _ => "Запрос не выполнен. Проверьте доступность модели и параметры API."
+            }));
+            continue;
+        }
+
+        using var json = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellation.Token));
+        if (!json.RootElement.TryGetProperty("status", out var status)
+            || status.GetString() != "completed")
+        {
+            Console.WriteLine("API не завершил ответ. Полный расчёт не получен; повторите запрос.");
+            continue;
+        }
+
+        var answer = new StringBuilder();
+        if (json.RootElement.TryGetProperty("output", out var output))
+        {
+            foreach (var item in output.EnumerateArray())
+            {
+                if (!item.TryGetProperty("content", out var content))
+                    continue;
+                foreach (var part in content.EnumerateArray())
+                {
+                    if (!part.TryGetProperty("type", out var type))
+                        continue;
+                    if (type.GetString() == "output_text" && part.TryGetProperty("text", out var text))
+                        answer.AppendLine(text.GetString());
+                    else if (type.GetString() == "refusal")
+                        answer.AppendLine("Модель отказалась сформировать ответ.");
+                }
+            }
+        }
+
+        Console.WriteLine(answer.Length == 0
+            ? "API вернул ответ без текста."
+            : answer.ToString().Replace(key, "[ключ скрыт]", StringComparison.Ordinal));
+    }
+    catch (OperationCanceledException)
+    {
+        Console.WriteLine(cancellation.IsCancellationRequested
+            ? "Запрос отменён."
+            : "Время ожидания API истекло. Повторите расчёт.");
+    }
+    catch (HttpRequestException)
+    {
+        Console.WriteLine("Не удалось подключиться к API. Проверьте соединение с интернетом.");
+    }
+    catch (UnauthorizedAccessException)
+    {
+        Console.WriteLine("Нет доступа к файлу ключа на рабочем столе.");
+    }
+    catch (IOException)
+    {
+        Console.WriteLine("Не удалось прочитать файл «Ключ» или «Ключ.txt» на рабочем столе.");
+    }
+    catch (InvalidDataException)
+    {
+        Console.WriteLine("Файл ключа должен содержать только один непустой API-ключ без пробелов.");
+    }
+    catch (JsonException)
+    {
+        Console.WriteLine("API вернул некорректный JSON.");
+    }
+}
+
+static async Task<string> ReadKeyAsync(CancellationToken cancellationToken)
+{
+    string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+    string path = Path.Combine(desktop, "Ключ");
+    if (!File.Exists(path))
+        path = Path.Combine(desktop, "Ключ.txt");
+
+    string key = (await File.ReadAllTextAsync(path, cancellationToken)).Trim();
+    if (string.IsNullOrWhiteSpace(key) || key.Any(c => c < 33 || c > 126))
+        throw new InvalidDataException();
+    return key;
+}
